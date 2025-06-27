@@ -38,29 +38,35 @@ struct InternalEntry {
 }
 
 #[derive(Debug)]
-struct InternalState {
+struct InnerState {
   // this ensures only one actual draw thread is running
   drawer_id: usize,
   hide_count: usize,
   has_draw_thread: bool,
   next_entry_id: u16,
   entries: Vec<InternalEntry>,
-  static_text: ConsoleStaticText,
 }
 
-impl InternalState {
+impl InnerState {
   pub fn should_exit_draw_thread(&self, drawer_id: usize) -> bool {
     self.drawer_id != drawer_id || self.entries.is_empty()
   }
 }
 
-static INTERNAL_STATE: Lazy<Arc<Mutex<InternalState>>> = Lazy::new(|| {
-  Arc::new(Mutex::new(InternalState {
-    drawer_id: 0,
-    hide_count: 0,
-    has_draw_thread: false,
-    entries: Vec::new(),
-    next_entry_id: 0,
+struct GlobalState {
+  state: Mutex<InnerState>,
+  static_text: ConsoleStaticText,
+}
+
+static GLOBAL_STATE: Lazy<Arc<GlobalState>> = Lazy::new(|| {
+  Arc::new(GlobalState {
+    state: Mutex::new(InnerState {
+      drawer_id: 0,
+      hide_count: 0,
+      has_draw_thread: false,
+      entries: Vec::new(),
+      next_entry_id: 0,
+    }),
     static_text: ConsoleStaticText::new(|| {
       let size = console_size().unwrap();
       console_static_text::ConsoleSize {
@@ -68,7 +74,7 @@ static INTERNAL_STATE: Lazy<Arc<Mutex<InternalState>>> = Lazy::new(|| {
         rows: Some(size.rows as u16),
       }
     }),
-  }))
+  })
 });
 
 static IS_TTY_WITH_CONSOLE_SIZE: Lazy<bool> = Lazy::new(|| {
@@ -94,29 +100,31 @@ impl DrawThread {
 
   /// Adds a renderer to the draw thread.
   pub fn add_entry(renderer: Arc<dyn DrawThreadRenderer>) -> DrawThreadGuard {
-    let internal_state = &*INTERNAL_STATE;
-    let mut internal_state = internal_state.lock();
-    let id = internal_state.next_entry_id;
-    internal_state.entries.push(InternalEntry { id, renderer });
+    let global_state = &*GLOBAL_STATE;
+    let mut state = global_state.state.lock();
+    let id = state.next_entry_id;
+    state.entries.push(InternalEntry { id, renderer });
 
-    if internal_state.next_entry_id == u16::MAX {
-      internal_state.next_entry_id = 0;
+    if state.next_entry_id == u16::MAX {
+      state.next_entry_id = 0;
     } else {
-      internal_state.next_entry_id += 1;
+      state.next_entry_id += 1;
     }
 
-    Self::maybe_start_draw_thread(&mut internal_state);
+    Self::maybe_start_draw_thread(&mut state);
 
     DrawThreadGuard(id)
   }
 
   /// Hides the draw thread.
   pub fn hide() {
-    let internal_state = &*INTERNAL_STATE;
-    let mut internal_state = internal_state.lock();
-    let is_showing =
-      internal_state.has_draw_thread && internal_state.hide_count == 0;
-    internal_state.hide_count += 1;
+    let global_state = &*GLOBAL_STATE;
+    let is_showing = {
+      let mut state = global_state.state.lock();
+      let is_showing = state.has_draw_thread && state.hide_count == 0;
+      state.hide_count += 1;
+      is_showing
+    };
 
     if is_showing {
       // Clear it on the current thread in order to stop it from
@@ -124,55 +132,58 @@ impl DrawThread {
       // because the calling code might be called from outside a
       // tokio runtime and when it goes to start the thread on the
       // thread pool it might panic.
-      internal_state.static_text.eprint_clear();
+      global_state.static_text.eprint_clear();
     }
   }
 
   /// Shows the draw thread if it was previously hidden.
   pub fn show() {
-    let internal_state = &*INTERNAL_STATE;
-    let mut internal_state = internal_state.lock();
-    if internal_state.hide_count > 0 {
-      internal_state.hide_count -= 1;
+    let global_state = &*GLOBAL_STATE;
+    let mut state = global_state.state.lock();
+    if state.hide_count > 0 {
+      state.hide_count -= 1;
     }
   }
 
   fn finish_entry(entry_id: u16) {
-    let internal_state = &*INTERNAL_STATE;
-    let mut internal_state = internal_state.lock();
+    let global_state = &*GLOBAL_STATE;
+    let should_clear = {
+      let mut state = global_state.state.lock();
+      if let Some(index) =
+        state.entries.iter().position(|e| e.id == entry_id)
+      {
+        state.entries.remove(index);
 
-    if let Some(index) =
-      internal_state.entries.iter().position(|e| e.id == entry_id)
-    {
-      internal_state.entries.remove(index);
-
-      if internal_state.entries.is_empty() {
-        Self::clear_and_stop_draw_thread(&mut internal_state);
+        if state.entries.is_empty() && state.has_draw_thread {
+          // bump the drawer id to exit the draw thread
+          state.drawer_id += 1;
+          state.has_draw_thread = false;
+          true // should_clear
+        } else {
+          false
+        }
+      } else {
+        false
       }
+    };
+
+    if should_clear {
+      global_state.static_text.eprint_clear();
     }
   }
 
-  fn clear_and_stop_draw_thread(internal_state: &mut InternalState) {
-    if internal_state.has_draw_thread {
-      internal_state.static_text.eprint_clear();
-      // bump the drawer id to exit the draw thread
-      internal_state.drawer_id += 1;
-      internal_state.has_draw_thread = false;
-    }
-  }
-
-  fn maybe_start_draw_thread(internal_state: &mut InternalState) {
-    if internal_state.has_draw_thread
-      || internal_state.entries.is_empty()
+  fn maybe_start_draw_thread(state: &mut InnerState) {
+    if state.has_draw_thread
+      || state.entries.is_empty()
       || !DrawThread::is_supported()
     {
       return;
     }
 
-    internal_state.drawer_id += 1;
-    internal_state.has_draw_thread = true;
+    state.drawer_id += 1;
+    state.has_draw_thread = true;
 
-    let drawer_id = internal_state.drawer_id;
+    let drawer_id = state.drawer_id;
     spawn_blocking(move || {
       let mut previous_size = console_size();
       loop {
@@ -180,13 +191,13 @@ impl DrawThread {
         {
           // Get the entries to render.
           let maybe_entries = {
-            let internal_state = &*INTERNAL_STATE;
-            let internal_state = internal_state.lock();
-            if internal_state.should_exit_draw_thread(drawer_id) {
+            let global_state = &*GLOBAL_STATE;
+            let state = global_state.state.lock();
+            if state.should_exit_draw_thread(drawer_id) {
               break;
             }
-            let should_display = internal_state.hide_count == 0;
-            should_display.then(|| internal_state.entries.clone())
+            let should_display = state.hide_count == 0;
+            should_display.then(|| state.entries.clone())
           };
 
           if let Some(entries) = maybe_entries {
@@ -225,12 +236,12 @@ impl DrawThread {
               // now reacquire the lock, ensure we should still be drawing, then
               // output the text
               {
-                let internal_state = &*INTERNAL_STATE;
-                let mut internal_state = internal_state.lock();
-                if internal_state.should_exit_draw_thread(drawer_id) {
+                let global_state = &*GLOBAL_STATE;
+                let mut state = global_state.state.lock();
+                if state.should_exit_draw_thread(drawer_id) {
                   break;
                 }
-                internal_state.static_text.eprint_with_size(
+                global_state.static_text.eprint_with_size(
                   &text,
                   console_static_text::ConsoleSize {
                     cols: Some(size.cols as u16),
